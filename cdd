@@ -1,0 +1,178 @@
+# pylint: disable=broad-exception-raised
+"""Publisher Handler."""
+from __future__ import annotations
+
+import json
+import traceback
+import base64
+from typing import Any
+from uuid import uuid4
+from functools import lru_cache
+
+from confluent_kafka.error import KeySerializationError, ValueSerializationError
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
+
+# Hardcoded configuration (replace with secure methods in production)
+SCHEMA_REGISTRY_URL = ''
+SCHEMA_REGISTRY_API_KEY = ''
+RAW_OUTBOUND_TOPIC = ''
+
+# Input and output file paths
+INPUT_FILE = ''
+OUTPUT_FILE = ''
+
+class SerializationContext:
+    def __init__(self, topic, field=None):
+        self.topic = topic
+        self.field = field
+
+def topic_record_subject_name_strategy(ctx, schema_name):
+    return f"{ctx.topic}-{ctx.field}"
+
+class AvroSerializerWrapper:
+    def __init__(self, processing_event_type: str):
+        self.processing_event_type = processing_event_type
+        self.schema_registry_conf = {
+            'url': SCHEMA_REGISTRY_URL,
+            'basic.auth.user.info': SCHEMA_REGISTRY_API_KEY
+        }
+        self.value_serializer = self._create_serializer('value')
+
+    def _create_serializer(self, field):
+        schema_registry_client = SchemaRegistryClient(self.schema_registry_conf)
+        schema_name = f"{self.processing_event_type}-{field}"
+        try:
+            schema = schema_registry_client.get_latest_version(schema_name)
+            return AvroSerializer(
+                schema_registry_client,
+                schema.schema.schema_str,
+                conf={
+                    "auto.register.schemas": False,
+                    "subject.name.strategy": topic_record_subject_name_strategy,
+                },
+            )
+        except Exception as e:
+            print(f"Error creating Avro serializer for {field}: {str(e)}")
+            raise
+
+    def serialize_message(self, topic_name: str, key: Any, value: Any):
+        try:
+            value_context = SerializationContext(topic_name, field="value")
+            serialized_value = self.value_serializer(value, value_context)
+            base64_value = base64.b64encode(serialized_value).decode('utf-8')
+            base64_key = base64.b64encode(str(key).encode()).decode('utf-8')
+            
+            print(f"Serialized and base64 encoded key: {base64_key[:50]}...")
+            print(f"Serialized and base64 encoded value: {base64_value[:100]}...")
+
+            return base64_key, base64_value
+        except ValueSerializationError as e:
+            print(f"Serialization failed: {str(e)}")
+            raise
+
+def encode_headers(headers):
+    encoded_headers = []
+    for header in headers:
+        key = header['key']
+        value = header.get('value')
+        if value is None:
+            encoded_value = []
+        else:
+            encoded_value = list(value.encode())
+        encoded_headers.append({key: encoded_value})
+    return encoded_headers
+
+def handler(
+        event: dict[str, Any], context: Any
+) -> dict[str, Any] | None:  # pylint: disable=unused-argument
+    """Handler to finalize, serialize, and publish event to Kafka."""
+    error_list: list[dict[str, Any]] = []
+    processing_event_type = event["processing_event_type"]
+    records = event["transformed_event"]["value"]
+    key = event["transformed_event"]["key"]
+    headers: Any = event["transformed_event"].get("headers", [])  # Default to empty list
+
+    try:
+        avro_serializer = fetch_serializer_instance(processing_event_type)
+
+        serialized_key, serialized_value = avro_serializer.serialize_message(
+            topic_name=RAW_OUTBOUND_TOPIC,
+            key=key,
+            value=records
+        )
+
+        # Encode headers using the new encode_headers function
+        encoded_headers = encode_headers(headers)
+
+        # Create the formatted message
+        formatted_message = {
+            "eventSource": "",
+            "bootstrapServers": "",
+            "records": {
+                "": [
+                    {
+                        "topic": RAW_OUTBOUND_TOPIC,
+                        "partition": event["transformed_event"].get('partition'),
+                        "offset": event["transformed_event"].get('offset'),
+                        "timestamp": event["transformed_event"].get('timestamp'),
+                        "timestampType": event["transformed_event"].get('timestampType'),
+                        "key": serialized_key,
+                        "value": serialized_value,
+                        "headers": encoded_headers
+                    }
+                ]
+            }
+        }
+
+        # Write the formatted message to the output file
+        with open(OUTPUT_FILE, 'w') as file:
+            json.dump(formatted_message, file, indent=2)
+        print(f"Formatted message written to {OUTPUT_FILE}")
+
+    except (KeySerializationError, ValueSerializationError) as e:
+        print(f"Exception during Serialization: {e}")
+        traceback.print_exc()
+        error_obj = {"Error message": str(e), "uuid": str(uuid4())}
+        error_list.append(error_obj)
+        raise Exception(f"Error 400: {error_obj}") from e
+    except Exception as e:
+        print(f"Exception while processing: {e}")
+        traceback.print_exc()
+        error_obj = {"Error message": str(e), "uuid": str(uuid4())}
+        error_list.append(error_obj)
+        raise Exception(f"Error 400: {error_obj}") from e
+    else:
+        return {
+            "formatted_message": formatted_message,
+            "statusCode": 200,
+            "pass": event,
+        }
+
+@lru_cache(maxsize=None)
+def fetch_serializer_instance(processing_event_type: str) -> AvroSerializerWrapper:
+    """Init AvroSerializerWrapper or return cached instance."""
+    return AvroSerializerWrapper(processing_event_type)
+
+if __name__ == '__main__':
+    # Read the input JSON file
+    with open(INPUT_FILE, 'r') as file:
+        input_data = json.load(file)
+
+    # Construct the test event
+    test_event = {
+        "processing_event_type": "",
+        "transformed_event": {
+            "value": input_data['value'],
+            "key": input_data.get('key', 'default_key'),
+            "headers": input_data.get('headers', []),  # Default to empty list
+            "partition": input_data.get('partition'),
+            "offset": input_data.get('offset'),
+            "timestamp": input_data.get('timestamp'),
+            "timestampType": input_data.get('timestampType')
+        }
+    }
+
+    test_context = type('TestContext', (), {'invoked_function_arn': 'test_arn'})()
+    result = handler(test_event, test_context)
+    print(result)
