@@ -118,7 +118,7 @@ def handler(
         # Encode headers using the new encode_headers function
         encoded_headers = encode_headers(headers)
 
-        # Create the formatted message
+        # Create the formatted message with the necessary records structure
         formatted_message = {
             "eventSource": "",
             "bootstrapServers": "",
