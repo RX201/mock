@@ -92,7 +92,7 @@ def invoke_lambda(formatted_message):
     response = lambda_client.invoke(
         FunctionName=LAMBDA_FUNCTION_NAME,
         InvocationType='RequestResponse',
-        Payload=json.dumps(formatted_message)
+        Payload=json.dumps({'body': json.dumps(formatted_message)})
     )
     return response
 
@@ -145,7 +145,11 @@ def handler(
 
         # Invoke the Lambda function with the formatted message
         lambda_response = invoke_lambda(formatted_message)
-        print(f"Lambda response: {lambda_response}")
+        
+        # Parse the Lambda function response
+        response_payload = json.loads(lambda_response['Payload'].read().decode('utf-8'))
+        
+        print(f"Lambda response: {response_payload}")
 
     except (KeySerializationError, ValueSerializationError) as e:
         print(f"Exception during Serialization: {e}")
