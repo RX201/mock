@@ -8,6 +8,7 @@ import base64
 from typing import Any
 from uuid import uuid4
 from functools import lru_cache
+import boto3
 
 from confluent_kafka.error import KeySerializationError, ValueSerializationError
 from confluent_kafka.schema_registry import SchemaRegistryClient
@@ -21,6 +22,9 @@ RAW_OUTBOUND_TOPIC = ''
 # Input and output file paths
 INPUT_FILE = ''
 OUTPUT_FILE = ''
+
+# Lambda function name
+LAMBDA_FUNCTION_NAME = 'your-lambda-function-name'
 
 class SerializationContext:
     def __init__(self, topic, field=None):
@@ -83,6 +87,15 @@ def encode_headers(headers):
         encoded_headers.append({key: encoded_value})
     return encoded_headers
 
+def invoke_lambda(formatted_message):
+    lambda_client = boto3.client('lambda')
+    response = lambda_client.invoke(
+        FunctionName=LAMBDA_FUNCTION_NAME,
+        InvocationType='RequestResponse',
+        Payload=json.dumps(formatted_message)
+    )
+    return response
+
 def handler(
         event: dict[str, Any], context: Any
 ) -> dict[str, Any] | None:  # pylint: disable=unused-argument
@@ -129,6 +142,10 @@ def handler(
         with open(OUTPUT_FILE, 'w') as file:
             json.dump(formatted_message, file, indent=2)
         print(f"Formatted message written to {OUTPUT_FILE}")
+
+        # Invoke the Lambda function with the formatted message
+        lambda_response = invoke_lambda(formatted_message)
+        print(f"Lambda response: {lambda_response}")
 
     except (KeySerializationError, ValueSerializationError) as e:
         print(f"Exception during Serialization: {e}")
