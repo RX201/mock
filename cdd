@@ -1,31 +1,14 @@
-# pylint: disable=broad-exception-raised
-"""Publisher Handler."""
-from __future__ import annotations
-
 import json
-import traceback
 import base64
-from typing import Any
-from uuid import uuid4
-from functools import lru_cache
-import boto3
-
-from confluent_kafka.error import KeySerializationError, ValueSerializationError
+import io
+import fastavro
+from fastavro.schema import load_schema
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
 
-# Hardcoded configuration (replace with secure methods in production)
 SCHEMA_REGISTRY_URL = ''
 SCHEMA_REGISTRY_API_KEY = ''
 RAW_OUTBOUND_TOPIC = ''
-
-# Input and output file paths
-INPUT_FILE = ''
-OUTPUT_FILE = ''
-
-# Lambda function name
-LAMBDA_FUNCTION_NAME = 'your-lambda-function-name'
-
 class SerializationContext:
     def __init__(self, topic, field=None):
         self.topic = topic
@@ -60,20 +43,18 @@ class AvroSerializerWrapper:
             print(f"Error creating Avro serializer for {field}: {str(e)}")
             raise
 
-    def serialize_message(self, topic_name: str, key: Any, value: Any):
-        try:
-            value_context = SerializationContext(topic_name, field="value")
-            serialized_value = self.value_serializer(value, value_context)
-            base64_value = base64.b64encode(serialized_value).decode('utf-8')
-            base64_key = base64.b64encode(str(key).encode()).decode('utf-8')
-            
-            print(f"Serialized and base64 encoded key: {base64_key[:50]}...")
-            print(f"Serialized and base64 encoded value: {base64_value[:100]}...")
+    def serialize_value(self, topic_name: str, value: Any):
+        value_context = SerializationContext(topic_name, field="value")
+        serialized_value = self.value_serializer(value, value_context)
+        base64_value = base64.b64encode(serialized_value).decode('utf-8')
+        return base64_value
 
-            return base64_key, base64_value
-        except ValueSerializationError as e:
-            print(f"Serialization failed: {str(e)}")
-            raise
+def read_json(file_path):
+    with open(file_path, 'r') as file:
+        return json.load(file)
+
+def base64_encode(data):
+    return base64.b64encode(data).decode('utf-8')
 
 def encode_headers(headers):
     encoded_headers = []
@@ -87,113 +68,39 @@ def encode_headers(headers):
         encoded_headers.append({key: encoded_value})
     return encoded_headers
 
-def invoke_lambda(formatted_message):
-    lambda_client = boto3.client('lambda')
-    response = lambda_client.invoke(
-        FunctionName=LAMBDA_FUNCTION_NAME,
-        InvocationType='RequestResponse',
-        Payload=json.dumps({'body': json.dumps(formatted_message)})
-    )
-    return response
-
-def handler(
-        event: dict[str, Any], context: Any
-) -> dict[str, Any] | None:  # pylint: disable=unused-argument
-    """Handler to finalize, serialize, and publish event to Kafka."""
-    error_list: list[dict[str, Any]] = []
-    processing_event_type = event["processing_event_type"]
-    records = event["transformed_event"]["value"]
-    key = event["transformed_event"]["key"]
-    headers: Any = event["transformed_event"].get("headers", [])  # Default to empty list
-
-    try:
-        avro_serializer = fetch_serializer_instance(processing_event_type)
-
-        serialized_key, serialized_value = avro_serializer.serialize_message(
-            topic_name=RAW_OUTBOUND_TOPIC,
-            key=key,
-            value=records
-        )
-
-        # Encode headers using the new encode_headers function
-        encoded_headers = encode_headers(headers)
-
-        # Create the formatted message with the necessary records structure
-        formatted_message = {
-            "eventSource": "",
-            "bootstrapServers": "",
-            "records": {
-                "": [
-                    {
-                        "topic": RAW_OUTBOUND_TOPIC,
-                        "partition": event["transformed_event"].get('partition'),
-                        "offset": event["transformed_event"].get('offset'),
-                        "timestamp": event["transformed_event"].get('timestamp'),
-                        "timestampType": event["transformed_event"].get('timestampType'),
-                        "key": serialized_key,
-                        "value": serialized_value,
-                        "headers": encoded_headers
-                    }
-                ]
-            }
-        }
-
-        # Write the formatted message to the output file
-        with open(OUTPUT_FILE, 'w') as file:
-            json.dump(formatted_message, file, indent=2)
-        print(f"Formatted message written to {OUTPUT_FILE}")
-
-        # Invoke the Lambda function with the formatted message
-        lambda_response = invoke_lambda(formatted_message)
-        
-        # Parse the Lambda function response
-        response_payload = json.loads(lambda_response['Payload'].read().decode('utf-8'))
-        
-        print(f"Lambda response: {response_payload}")
-
-    except (KeySerializationError, ValueSerializationError) as e:
-        print(f"Exception during Serialization: {e}")
-        traceback.print_exc()
-        error_obj = {"Error message": str(e), "uuid": str(uuid4())}
-        error_list.append(error_obj)
-        raise Exception(f"Error 400: {error_obj}") from e
-    except Exception as e:
-        print(f"Exception while processing: {e}")
-        traceback.print_exc()
-        error_obj = {"Error message": str(e), "uuid": str(uuid4())}
-        error_list.append(error_obj)
-        raise Exception(f"Error 400: {error_obj}") from e
-    else:
-        return {
-            "formatted_message": formatted_message,
-            "statusCode": 200,
-            "pass": event,
-        }
-
-@lru_cache(maxsize=None)
-def fetch_serializer_instance(processing_event_type: str) -> AvroSerializerWrapper:
-    """Init AvroSerializerWrapper or return cached instance."""
-    return AvroSerializerWrapper(processing_event_type)
-
-if __name__ == '__main__':
-    # Read the input JSON file
-    with open(INPUT_FILE, 'r') as file:
-        input_data = json.load(file)
-
-    # Construct the test event
-    test_event = {
-        "processing_event_type": "",
-        "transformed_event": {
-            "value": input_data['value'],
-            "key": input_data.get('key', 'default_key'),
-            "headers": input_data.get('headers', []),  # Default to empty list
-            "partition": input_data.get('partition'),
-            "offset": input_data.get('offset'),
-            "timestamp": input_data.get('timestamp'),
-            "timestampType": input_data.get('timestampType')
+def format_message(json_message, processing_event_type):
+    key = base64_encode(json_message['key'].encode())
+    avro_serializer = AvroSerializerWrapper(processing_event_type)
+    value = avro_serializer.serialize_value(RAW_OUTBOUND_TOPIC, json_message['value'])
+    headers = encode_headers(json_message['headers'])
+    formatted_message = {
+        "eventSource": "",
+        "bootstrapServers": "",
+        "records": {
+            "": [
+                {
+                    "topic": "",
+                    "partition": json_message['partition'],
+                    "offset": json_message['offset'],
+                    "timestamp": json_message['timestamp'],
+                    "timestampType": json_message['timestampType'],
+                    "key": key,
+                    "value": value,
+                    "headers": headers
+                }
+            ]
         }
     }
+    return formatted_message
 
-    test_context = type('TestContext', (), {'invoked_function_arn': 'test_arn'})()
-    result = handler(test_event, test_context)
-    print(result)
+def main():
+    json_file_path = ''
+    output_file_path = ''
+    json_message = read_json(json_file_path)
+    processing_event_type = ""
+    formatted_message = format_message(json_message, processing_event_type)
+    with open(output_file_path, 'w') as output_file:
+        json.dump(formatted_message, output_file, indent=4)
+
+if __name__ == '__main__':
+    main()
